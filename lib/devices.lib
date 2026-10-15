@@ -1,0 +1,67 @@
+//#############################################################################
+// devices.lib -- shared code of the single-device engines (engines/devices/).
+// Every device has the same common controls:
+//   common/seed   seeded variation
+//   common/time   device time scale: rhythms and envelopes run T times faster
+//                 (0.01 = 100x slower), pitch untouched -> native stretch
+//   common/pitch  semitones: tones and resonances move, rhythm untouched
+// and up to 8 device controls in the "params" group. Output: one channel.
+// Device code follows engines/ward.dsp (references in docs/medical_refs.md).
+//#############################################################################
+
+import("stdfaust.lib");
+ct = library("contract.lib");
+
+cm(x) = hgroup("[0]common", x);
+seed  = cm(nentry("[0]seed", 1, 0, 9999, 1)) : int;
+T     = cm(hslider("[1]time [scale:log]", 1, 0.01, 8, 0.0001)) : ct.lag(0.2);
+P     = cm(hslider("[2]pitch [unit:semitone]", 0, -48, 24, 0.01)) : ct.lag(0.05) : /(12.0) : ct.exp2;
+dpar(x) = hgroup("[1]params", x);
+
+key = ct.hash(seed);
+nkey(n) = ct.hash(key + 7919 * n);
+
+osc(f) = ct.phasor(min(max(f, 0.0) / ma.SR, 0.49));
+clk(f) = osc(f * T);                  // rhythm, in device time
+ton(f) = osc(f * P);                  // tone
+harm(ph, h) = ct.sin2pi(ma.frac(float(h) * ph));
+hgate(f, h) = ct.bandGate(float(h) * f * P);   // harmonic h of a tone f below Nyquist
+wrapped(ph) = ph < ph';
+
+// device-time seconds since the last trigger (0 on the trigger sample)
+since(tr) = loop ~ _
+with {
+    loop(y) = (y + T / ma.SR) * (1.0 - float(tr));
+};
+
+// linear attack / release gate of length d starting at s (device seconds)
+gate(t, s, d, r) = max(0.0, min(1.0, min((t - s) / r, (s + d - t) / r)));
+
+// filters whose centre follows pitch
+hz(f) = min(f * P, 0.45 * ma.SR);
+bpf(f, k, x) = ct.svfbp(ct.tanpi(hz(f) / ma.SR), k, x);
+
+//-------------------------------- heart -------------------------------------
+// Beat clock in device time with seeded interval jitter and PVCs followed by
+// a compensatory pause. rate: beats per device-second. Out: trigger, PVC flag.
+beats(rate, pPVC, hrv) = loop ~ (_, _, _, _) : (!, !, !, !, _, _)
+with {
+    loop(ph0, m0, pend0, i0) = ph, m, pend, i, w, pvcNow
+    with {
+        mE  = select2(ct.isFirst, m0, 1.0);
+        x   = ph0 + rate * T / (ma.SR * mE);
+        w   = x >= 1.0;
+        ph  = select2(w, x, x - 1.0);
+        i   = i0 + float(w);
+        h   = ct.hash(key + int(i) * 1640531527 + 11);
+        newPVC = (0.5 + 0.5 * ct.ulo(h)) < pPVC;
+        jit = 1.0 + 0.04 * hrv * ct.uhi(h);
+        mNext = select2(pend0 > 0.5, select2(newPVC, jit, 0.62), 1.38);
+        m   = select2(w, mE, mNext);
+        pend = select2(w, pend0, select2(pend0 > 0.5, float(newPVC), 0.0));
+        pvcNow = ba.sAndH(w, pend0);
+    };
+};
+
+// heart rate with a slow seeded drift, bpm
+hrDrift(hr, hrv) = max(10.0, hr + 4.0 * hrv * ct.ou(20, ct.ulo(ct.hash(key + ct.tickIdx * 1640531527)) * sqrt(3.0)));
